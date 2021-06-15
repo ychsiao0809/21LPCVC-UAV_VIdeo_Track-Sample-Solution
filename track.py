@@ -77,6 +77,20 @@ def draw_boxes(img, bbox, cls_names, scores, ball_detect, identities=None, offse
         cv2.rectangle(img, (x1, y1), (x1 + t_size[0] + 3, y1 + t_size[1] + 4), color, -1)
         cv2.putText(img, label, (x1, y1 + t_size[1] + 4), cv2.FONT_HERSHEY_PLAIN, 2, [255, 255, 255], 2)
 
+class QuantModel(torch.nn.Module):
+    def __init__(self, weights, device):
+        super(QuantModel, self).__init__()
+        self.quant = torch.quantization.QuantStub()
+        self.model = attempt_load(weights, map_location=device)
+        self.dequant = torch.quantization.DeQuantStub()
+
+    def forward(self, x):
+        for m in self.model:
+            x = self.quant(x)
+            x = m(x)
+            x = self.dequant(x)
+
+        return x
 
 def detect(opt, device, save_img=False):
     out, source, weights, view_img, save_txt, imgsz = \
@@ -112,12 +126,22 @@ def detect(opt, device, save_img=False):
         shutil.rmtree(out)  # delete output folder
     os.makedirs(out)  # make new output folder
 
+    # qnnpack
+    torch.backends.quantized.engine = 'qnnpack'
+
     # Load model
-    model = attempt_load(weights, map_location=device)  # load FP32 model
-    stride = int(model.stride.max())  # model stride
+    # model = attempt_load(weights, map_location=device)  # load FP32 model
+    quantModel = QuantModel(weights, device)
+    stride = int(quantModel.model.stride.max())  # model stride
     imgsz = check_img_size(imgsz, s=stride)  # check img_size
-    if half:
-        model.half()  # to FP16
+    # if half:
+    #     model.half()  # to FP16
+
+    # Use dynamic
+    # model = torch.quantization.quantize_dynamic(
+    #     model,  # the original model
+    #     {torch.nn.Linear},  # a set of layers to dynamically quantize
+    #     dtype=torch.qint8)
 
     # Second-stage classifier
     classify = False
@@ -135,12 +159,12 @@ def detect(opt, device, save_img=False):
         dataset = LoadImages(source, img_size=imgsz, stride=stride)
 
     # Get names and colors
-    names = model.module.names if hasattr(model, 'module') else model.names
+    names = quantModel.model.module.names if hasattr(quantModel.model, 'module') else quantModel.model.names
     colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(names))]
 
     # Run inference
     if device.type != 'cpu':
-        model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
+        quantModel.model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(quantModel.model.parameters())))  # run once
     t0 = time.time()
     for path, img, im0s, vid_cap in dataset:
         img = torch.from_numpy(img).to(device)
@@ -151,7 +175,7 @@ def detect(opt, device, save_img=False):
 
         # Inference
         t1 = time_synchronized()
-        pred = model(img, augment=opt.augment)[0]
+        pred = quantModel.model(img, augment=opt.augment)[0]
 
         # Apply NMS
         pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
